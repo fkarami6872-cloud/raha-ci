@@ -1,0 +1,75 @@
+name: shots-havashenas-ios
+
+# Built in a throw-away public repo (ephemeral-build.sh): manual dispatch only.
+# Two jobs per push: the unsigned device IPA, and store/review screenshots from the simulator (sample data, no network).
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: shots-havashenas-ios
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+jobs:
+  shots:
+    runs-on: macos-15
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - name: Tools
+        run: brew install xcodegen
+      - name: Project
+        run: xcodegen generate
+      - name: Pick simulators
+        run: |
+          pick() { xcrun simctl list devices available -j | python3 -c "
+          import json,sys
+          names=sys.argv[1].split('|'); d=json.load(sys.stdin)['devices']
+          for n in names:
+              for r in sorted(d,reverse=True):
+                  if 'iOS' not in r: continue
+                  for x in d[r]:
+                      if x['name']==n: print(x['udid']); sys.exit(0)
+          " "$1"; }
+          echo "UDID_67=$(pick 'iPhone 16 Pro Max|iPhone 16 Plus|iPhone 15 Pro Max|iPhone 15 Plus')" >> "$GITHUB_ENV"
+          echo "UDID_61=$(pick 'iPhone 16|iPhone 15|iPhone 14')" >> "$GITHUB_ENV"
+      - name: Build for testing
+        run: |
+          set -o pipefail
+          xcodebuild build-for-testing -project Havashenas.xcodeproj -scheme Havashenas -configuration Release \
+            -destination "id=$UDID_67" -derivedDataPath build CODE_SIGNING_ALLOWED=NO 2>&1 | tee build.log | grep -E "error|BUILD|\*\*" | tail -n 40
+      - name: Capture
+        run: |
+          for pair in "6.7-inch:$UDID_67" "6.1-inch:$UDID_61"; do
+            name=${pair%%:*}; udid=${pair#*:}
+            [ -n "$udid" ] || { echo "no simulator for $name"; continue; }
+            xcrun simctl boot "$udid" || true
+            xcrun simctl bootstatus "$udid" -b
+            xcrun simctl status_bar "$udid" override --time 9:41 --batteryState charged --batteryLevel 100 --cellularBars 4 --wifiBars 3 || true
+            mkdir -p "$PWD/shots/$name"
+            TEST_RUNNER_SHOT_DIR="$PWD/shots/$name" xcodebuild test-without-building -project Havashenas.xcodeproj -scheme Havashenas \
+              -configuration Release -destination "id=$udid" -derivedDataPath build -resultBundlePath "res-$name.xcresult" \
+              CODE_SIGNING_ALLOWED=NO 2>&1 | grep -E "Test Case|error|\*\*" | tail -n 15 || true
+            if [ -z "$(ls shots/$name 2>/dev/null)" ]; then
+              xcrun xcresulttool export attachments --path "res-$name.xcresult" --output-path "shots/$name" || true
+            fi
+            ls -l "shots/$name" || true
+            xcrun simctl shutdown "$udid" || true
+          done
+      - name: Zip shots
+        if: always()
+        run: (cd shots && zip -qr ../shots.zip .) || true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with: { name: shots, path: shots.zip }
+      - name: Shots release
+        if: always()
+        env: { GH_TOKEN: "${{ github.token }}" }
+        run: |
+          gh release create "havashenas-shots-${GITHUB_RUN_NUMBER}" shots.zip --prerelease --target "$GITHUB_SHA" \
+            --title "Havashenas screenshots ${GITHUB_RUN_NUMBER}" --notes "simulator screenshots"
+      - name: Errors on failure
+        if: failure()
+        run: grep -n -E "error:|error " build.log | head -60 || true

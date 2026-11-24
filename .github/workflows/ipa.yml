@@ -1,0 +1,49 @@
+name: ipa-havashenas-ios
+
+# Built in a throw-away public repo (ephemeral-build.sh): manual dispatch only.
+# Two jobs per push: the unsigned device IPA, and store/review screenshots from the simulator (sample data, no network).
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: ipa-havashenas-ios
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+jobs:
+  ipa:
+    runs-on: macos-15
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - name: Tools
+        run: brew install xcodegen
+      - name: Project
+        run: xcodegen generate
+      - name: Build (unsigned)
+        run: |
+          set -o pipefail
+          xcodebuild -project Havashenas.xcodeproj -scheme Havashenas -configuration Release \
+            -sdk iphoneos -destination 'generic/platform=iOS' -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
+            build 2>&1 | tee build.log | grep -E "error|warning: unre|BUILD|\*\*" | tail -n 60
+      - name: Package IPA
+        run: |
+          APP=$(ls -d build/Build/Products/Release-iphoneos/*.app | head -1)
+          mkdir -p out/Payload && cp -R "$APP" out/Payload/
+          (cd out && zip -qry "../Havashenas-${GITHUB_RUN_NUMBER}.ipa" Payload)
+          ls -lh *.ipa
+          /usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$APP/Info.plist"
+      - uses: actions/upload-artifact@v4
+        with: { name: ipa, path: "*.ipa" }
+      - name: IPA release
+        env: { GH_TOKEN: "${{ github.token }}" }
+        run: |
+          gh release create "havashenas-ios-${GITHUB_RUN_NUMBER}" *.ipa --prerelease --target "$GITHUB_SHA" \
+            --title "Havashenas iOS build ${GITHUB_RUN_NUMBER}" --notes "unsigned IPA, commit ${GITHUB_SHA}"
+      - name: Errors on failure
+        if: failure()
+        run: grep -n -E "error:|error " build.log | head -60 || true
+
